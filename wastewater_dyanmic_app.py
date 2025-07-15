@@ -1,167 +1,217 @@
 import streamlit as st
-import numpy as np
-import pandas as pd
-from scipy.integrate import solve_ivp
+import math
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Dynamic Wastewater Simulator",
-    page_icon="🌍",
+    page_title="Wastewater Process Design Simulator",
+    page_icon="💧",
     layout="wide"
 )
 
-# --- Dynamic Model (ODEs for a CSTR) ---
-# This model's internal units are fixed: time in days, mass in mg, volume in m³
-def cstr_model(t, y, Q, V, S_in, Y, k_d, K_s, mu_max, K_La, DO_sat, OTR_factor):
-    """
-    Defines the ordinary differential equations for the CSTR model.
-    y[0] = S (Substrate concentration, mg/L)
-    y[1] = X (Biomass concentration, mg/L)
-    y[2] = DO (Dissolved Oxygen concentration, mg/L)
-    """
-    S, X, DO = y
+# --- Conversion Factors ---
+MGD_to_M3D = 3785.41
+M3_to_GAL = 264.172
+M2_to_FT2 = 10.7639
+M_to_FT = 3.28084
+KG_to_LBS = 2.20462
+GFD_to_MMD = 1 / 24.5425 # Gal/ft²/day to m³/m²/day
 
-    # Specific growth rate (Monod equation with DO limitation)
-    mu = mu_max * (S / (K_s + S)) * (DO / (0.5 + DO))
-
-    # Rates of change (ODEs)
-    dS_dt = (Q / V) * (S_in - S) - (mu / Y) * X
-    dX_dt = mu * X - k_d * X - (Q / V) * X
+# --- Calculation Logic ---
+def calculate_design(inputs, unit_system):
+    """
+    Performs all wastewater design calculations based on user inputs.
+    All internal calculations are done in Metric units.
     
-    # Oxygen Uptake Rate (OUR) is proportional to growth
-    OUR = (mu / Y) * X * OTR_factor
-    dDO_dt = K_La * (DO_sat - DO) - OUR
+    Args:
+        inputs (dict): A dictionary containing all the input values from the sidebar.
+        unit_system (str): The selected unit system ("Metric" or "US Conventional").
+        
+    Returns:
+        dict: A dictionary containing all the calculated results in Metric units.
+    """
+    
+    # --- Convert inputs to Metric if US Conventional is selected ---
+    if unit_system == "US Conventional (MGD, gal, lbs)":
+        Q = inputs['qAvg'] * MGD_to_M3D
+        maxSOR = inputs['maxSOR'] * GFD_to_MMD
+    else: # Metric
+        Q = inputs['qAvg']
+        maxSOR = inputs['maxSOR']
 
-    return [dS_dt, dX_dt, dDO_dt]
+    # Unpack other inputs (they are unit-independent or already handled)
+    S0 = inputs['s0']
+    NH3N_in = inputs['nh3n']
+    peakFactor = inputs['peakFactor']
+    Y = inputs['y']
+    kd = inputs['kd']
+    SRT = inputs['srt']
+    MLSS = inputs['mlss']
+    mlvssRatio = inputs['mlvssRatio'] / 100
+    Se = inputs['seBOD']
+    fillFraction = inputs['fillFraction'] / 100
+    carrierSSA = inputs['carrierSSA']
+    salr = inputs['salr']
+
+    results = {}
+
+    # 1. Aeration Tank & Sludge (Calculations in Metric)
+    results['bodLoad_kg'] = Q * S0 / 1000 if Q > 0 and S0 > 0 else 0
+    results['MLVSS'] = MLSS * mlvssRatio
+    
+    denominator_tank_vol = results['MLVSS'] * (1 + kd * SRT)
+    if denominator_tank_vol > 0:
+        results['tankVolume_m3'] = (Q * Y * (S0 - Se) * SRT) / denominator_tank_vol
+    else:
+        results['tankVolume_m3'] = 0
+
+    results['hrt_hr'] = (results['tankVolume_m3'] / Q) * 24 if Q > 0 else 0
+    
+    biomassInTank_kg = results['tankVolume_m3'] * results['MLVSS'] / 1000
+    results['was_kg'] = biomassInTank_kg / SRT if SRT > 0 else 0
+    
+    denominator_fm = results['MLVSS'] * results['tankVolume_m3'] / 1000
+    results['fmRatio'] = results['bodLoad_kg'] / denominator_fm if denominator_fm > 0 else 0
+
+    # 2. Secondary Clarifier (Calculations in Metric)
+    results['qPeak_m3d'] = Q * peakFactor
+    results['clarifierArea_m2'] = results['qPeak_m3d'] / maxSOR if maxSOR > 0 else 0
+    results['peakSOR_mmd'] = results['qPeak_m3d'] / results['clarifierArea_m2'] if results['clarifierArea_m2'] > 0 else 0
+    results['clarifierDiameter_m'] = math.sqrt(4 * results['clarifierArea_m2'] / math.pi) if results['clarifierArea_m2'] > 0 else 0
+
+    # 3. MBBR Design (Calculations in Metric)
+    results['nh3nLoad_kg'] = Q * NH3N_in / 1000
+    results['requiredCarrierArea_m2'] = (results['nh3nLoad_kg'] * 1000) / salr if salr > 0 else 0
+    results['carrierVolume_m3'] = results['requiredCarrierArea_m2'] / carrierSSA if carrierSSA > 0 else 0
+    results['mbbrTankVolume_m3'] = results['carrierVolume_m3'] / fillFraction if fillFraction > 0 else 0
+    
+    return results
 
 # --- UI Layout ---
-st.title("🌍 Dynamic Wastewater Process Simulator")
-st.markdown("This app simulates the dynamic response of an activated sludge process. Use the sidebar to configure parameters in your preferred unit system and run the simulation.")
 
-# --- Sidebar for Inputs ---
-st.sidebar.header("⚙️ Configuration")
+# Header
+st.title("💧 Wastewater Process Design Simulator")
+st.markdown("This application provides a preliminary design for an activated sludge process with MBBR integration for nitrification. Adjust the parameters in the sidebar to see the design calculations update in real-time.")
 
-# Unit System Selection
+# Sidebar for Inputs
+st.sidebar.header("Inputs & Assumptions")
+
 unit_system = st.sidebar.radio(
-    "Unit System",
-    ["Conventional (m³/day, mg/L)", "SI (m³/s, kg/m³)"],
-    help="Select the unit system for inputs and outputs."
+    "Select Unit System",
+    ("Metric (m³, L, kg)", "US Conventional (MGD, gal, lbs)")
 )
 
-# --- Input Sections based on Unit System ---
-if unit_system == "Conventional (m³/day, mg/L)":
-    # Plant Design Parameters
-    with st.sidebar.expander("Plant Design Parameters", expanded=True):
-        Q = st.number_input("Average Daily Flow (Q, m³/day)", min_value=0.0, value=5000.0, step=100.0)
-        V = st.number_input("Aeration Tank Volume (V, m³)", min_value=0.0, value=2500.0, step=100.0)
-        S_in_base = st.number_input("Normal Influent BOD (S_in, mg/L)", min_value=0.0, value=250.0, step=10.0)
-        X_initial = st.number_input("Initial Biomass (MLVSS, mg/L)", min_value=0.0, value=2800.0, step=100.0)
-    # Kinetic & Oxygen Parameters
-    with st.sidebar.expander("Kinetic & Oxygen Parameters"):
-        k_d = st.slider("Endogenous Decay (k_d, 1/day)", 0.04, 0.1, 0.06, 0.01)
-        K_La = st.slider("Oxygen Transfer Coeff. (K_La, 1/day)", 100.0, 300.0, 240.0, 10.0)
-        K_s = st.slider("Half-Saturation Constant (K_s, mg/L)", 10.0, 50.0, 20.0, 5.0)
-        # Shock Load Inputs
-        st.sidebar.header("🕹️ Simulation Control")
-        shock_load_mag = st.sidebar.number_input("Shock Load BOD (mg/L)", min_value=0.0, value=600.0, step=50.0)
-else: # SI units
-    with st.sidebar.expander("Plant Design Parameters", expanded=True):
-        Q = st.number_input("Average Flow (Q, m³/s)", min_value=0.0, value=0.058, step=0.01, format="%.3f")
-        V = st.number_input("Aeration Tank Volume (V, m³)", min_value=0.0, value=2500.0, step=100.0)
-        S_in_base = st.number_input("Normal Influent BOD (S_in, kg/m³)", min_value=0.0, value=0.25, step=0.01, format="%.2f")
-        X_initial = st.number_input("Initial Biomass (MLVSS, kg/m³)", min_value=0.0, value=2.8, step=0.1, format="%.2f")
-    with st.sidebar.expander("Kinetic & Oxygen Parameters"):
-        k_d = st.slider("Endogenous Decay (k_d, 1/s)", 0.0000005, 0.0000012, 0.0000007, 0.0000001, format="%.7f")
-        K_La = st.slider("Oxygen Transfer Coeff. (K_La, 1/s)", 0.001, 0.004, 0.0028, 0.0001, format="%.4f")
-        K_s = st.slider("Half-Saturation Constant (K_s, kg/m³)", 0.01, 0.05, 0.02, 0.005, format="%.3f")
-        # Shock Load Inputs
-        st.sidebar.header("🕹️ Simulation Control")
-        shock_load_mag = st.sidebar.number_input("Shock Load BOD (kg/m³)", min_value=0.0, value=0.6, step=0.1, format="%.2f")
+inputs = {}
+if unit_system == "Metric (m³, L, kg)":
+    inputs['qAvg'] = st.sidebar.number_input("Average Daily Flow (Q, m³/day)", min_value=0.0, value=5000.0, step=100.0)
+    inputs['maxSOR'] = st.sidebar.number_input("Max Clarifier SOR (m³/m²·d)", min_value=1.0, value=48.0, step=1.0)
+else: # US Conventional
+    inputs['qAvg'] = st.sidebar.number_input("Average Daily Flow (Q, MGD)", min_value=0.0, value=1.3, step=0.1)
+    inputs['maxSOR'] = st.sidebar.number_input("Max Clarifier SOR (gal/ft²·d)", min_value=1.0, value=1200.0, step=10.0)
 
-# Shared Parameters (Unit-agnostic or simple)
-with st.sidebar.expander("Shared Kinetic Parameters"):
-    Y = st.slider("Biomass Yield (Y, mg VSS/mg BOD)", 0.3, 0.7, 0.5, 0.05)
-    mu_max_d = st.slider("Max Specific Growth Rate (μ_max, 1/day)", 2.0, 8.0, 4.0, 0.5, help="This parameter is always entered in 1/day.")
-    DO_sat = st.slider("DO Saturation (DO_sat, g/m³ or mg/L)", 8.0, 10.0, 9.2, 0.1)
-    OTR_factor = st.slider("Oxygen Usage Factor (1-Y)", 0.3, 0.7, 0.5, 0.05, help="Represents (1-Y), the fraction of substrate used for respiration.")
+# Unit-independent inputs
+inputs['s0'] = st.sidebar.number_input("Influent BOD₅ (S₀, mg/L)", min_value=0.0, value=250.0, step=10.0)
+inputs['nh3n'] = st.sidebar.number_input("Influent NH₃-N (mg/L)", min_value=0.0, value=40.0, step=5.0)
+inputs['peakFactor'] = st.sidebar.number_input("Peaking Factor (for Qpeak)", min_value=1.0, value=2.5, step=0.1)
+inputs['y'] = st.sidebar.number_input("Biomass Yield (Y, mg VSS/mg BOD₅)", min_value=0.0, value=0.5, step=0.05, format="%.2f")
+inputs['kd'] = st.sidebar.number_input("Endogenous Decay Coeff. (kₔ, 1/day)", min_value=0.0, value=0.06, step=0.01, format="%.3f")
+inputs['srt'] = st.sidebar.number_input("Target SRT (days)", min_value=1.0, value=12.0, step=1.0)
+inputs['mlss'] = st.sidebar.number_input("Target MLSS (mg/L)", min_value=0.0, value=3500.0, step=100.0)
+inputs['mlvssRatio'] = st.sidebar.number_input("MLVSS/MLSS Ratio (%)", min_value=0.0, value=80.0, step=1.0)
+inputs['seBOD'] = st.sidebar.number_input("Effluent BOD₅ (Se, mg/L)", min_value=0.0, value=10.0, step=1.0)
+inputs['fillFraction'] = st.sidebar.number_input("MBBR Carrier Fill Fraction (%)", min_value=0.0, max_value=100.0, value=50.0, step=1.0)
+inputs['carrierSSA'] = st.sidebar.number_input("Carrier Specific Surface Area (m²/m³)", min_value=0.0, value=500.0, step=10.0)
+inputs['salr'] = st.sidebar.number_input("Surface Area Loading Rate (SALR, g NH₃-N/m²·d)", min_value=0.0, value=1.2, step=0.1)
 
-# Shared Simulation Control
-sim_duration = st.sidebar.slider("Simulation Duration (days)", 1, 30, 10)
-shock_start_time = st.sidebar.slider("Shock Start Time (day)", 0.0, float(sim_duration-1), 2.0, 0.5)
-shock_duration = st.sidebar.slider("Shock Duration (days)", 0.1, 5.0, 1.0, 0.1)
+# --- Main Panel for Outputs ---
+st.header("Calculated Design Parameters")
 
+# Perform calculations
+results = calculate_design(inputs, unit_system)
 
-# --- Main Panel for Simulation ---
-if st.button("🚀 Run Dynamic Simulation"):
+# Create columns for the result cards
+col1, col2, col3 = st.columns(3)
 
-    # --- Unit Conversion to Model's Base Units ---
-    if unit_system == "SI (m³/s, kg/m³)":
-        Q_model = Q * 86400  # m³/s to m³/day
-        S_in_base_model = S_in_base * 1000  # kg/m³ to mg/L
-        X_initial_model = X_initial * 1000 # kg/m³ to mg/L
-        k_d_model = k_d * 86400  # 1/s to 1/day
-        K_La_model = K_La * 86400 # 1/s to 1/day
-        K_s_model = K_s * 1000 # kg/m³ to mg/L
-        shock_load_mag_model = shock_load_mag * 1000 # kg/m³ to mg/L
-    else: # Conventional units are already the model's base units
-        Q_model, S_in_base_model, X_initial_model, k_d_model, K_La_model, K_s_model, shock_load_mag_model = \
-        Q, S_in_base, X_initial, k_d, K_La, K_s, shock_load_mag
-
-    # --- Simulation Logic ---
-    t_span = [0, sim_duration]
-    t_eval = np.linspace(t_span[0], t_span[1], num=sim_duration * 200)
-
-    def get_S_in(t):
-        if shock_start_time <= t <= shock_start_time + shock_duration:
-            return shock_load_mag_model
-        return S_in_base_model
-
-    def model_with_shock(t, y):
-        S_in_t = get_S_in(t)
-        return cstr_model(t, y, Q_model, V, S_in_t, Y, k_d_model, K_s_model, mu_max_d, K_La_model, DO_sat, OTR_factor)
-
-    y0 = [S_in_base_model, X_initial_model, 2.0]
-
-    with st.spinner('Running simulation... this may take a moment.'):
-        sol = solve_ivp(model_with_shock, t_span, y0, t_eval=t_eval, method='RK45', dense_output=True)
-
-        # --- Unit Conversion for Outputs ---
-        if unit_system == "SI (m³/s, kg/m³)":
-            bod_results = sol.y[0] / 1000
-            biomass_results = sol.y[1] / 1000
-            do_results = sol.y[2] / 1000
-            bod_label, biomass_label, do_label = "Effluent BOD (kg/m³)", "Biomass (MLVSS, kg/m³)", "Dissolved Oxygen (kg/m³)"
-        else:
-            bod_results, biomass_results, do_results = sol.y[0], sol.y[1], sol.y[2]
-            bod_label, biomass_label, do_label = "Effluent BOD (mg/L)", "Biomass (MLVSS, mg/L)", "Dissolved Oxygen (mg/L)"
-
-        results_df = pd.DataFrame({
-            'Time (days)': sol.t,
-            bod_label: bod_results,
-            biomass_label: biomass_results,
-            do_label: do_results
-        })
-
-    st.success("✅ Simulation Complete!")
-
-    # --- Display Results ---
-    st.header("📊 Simulation Results")
-    col1, col2 = st.columns(2)
-
+# Display results based on selected unit system
+if unit_system == "Metric (m³, L, kg)":
     with col1:
-        st.subheader("Substrate & Biomass")
-        st.line_chart(results_df, x='Time (days)', y=[bod_label, biomass_label])
+        st.subheader("📊 Aeration Tank & Sludge")
+        st.metric(label="BOD₅ Load (kg/day)", value=f"{results['bodLoad_kg']:.2f}")
+        st.metric(label="MLVSS Target (mg/L)", value=f"{results['MLVSS']:.0f}")
+        st.metric(label="Required Tank Volume (m³)", value=f"{results['tankVolume_m3']:.0f}")
+        st.metric(label="HRT (hours)", value=f"{results['hrt_hr']:.2f}")
+        st.metric(label="Sludge Wasted (WAS, kg/day)", value=f"{results['was_kg']:.2f}")
+        st.metric(label="F:M Ratio", value=f"{results['fmRatio']:.2f}")
 
     with col2:
-        st.subheader("Dissolved Oxygen")
-        st.line_chart(results_df, x='Time (days)', y=do_label, color='#FF4B4B')
+        st.subheader("💧 Secondary Clarifier")
+        st.metric(label="Peak Flow (m³/day)", value=f"{results['qPeak_m3d']:.0f}")
+        st.metric(label="Required Surface Area (m²)", value=f"{results['clarifierArea_m2']:.1f}")
+        
+        peak_sor_val = results['peakSOR_mmd']
+        max_sor_val = inputs['maxSOR']
+        st.metric(label="Peak SOR (m³/m²·d)", value=f"{peak_sor_val:.2f}")
+        if peak_sor_val > max_sor_val:
+            st.error(f"Warning: Peak SOR ({peak_sor_val:.2f}) exceeds max ({max_sor_val:.2f}).")
+        else:
+            st.success(f"Peak SOR is within the design limit.")
+
+        st.metric(label="Calculated Diameter (m)", value=f"{results['clarifierDiameter_m']:.2f}")
+
+    with col3:
+        st.subheader("🦠 MBBR for Nitrification")
+        st.metric(label="Ammonia Load (kg/day)", value=f"{results['nh3nLoad_kg']:.2f}")
+        st.metric(label="Required Carrier Surface Area (m²)", value=f"{results['requiredCarrierArea_m2']:.0f}")
+        st.metric(label="Required Carrier Volume (m³)", value=f"{results['carrierVolume_m3']:.1f}")
+        st.metric(label="Required MBBR Tank Volume (m³)", value=f"{results['mbbrTankVolume_m3']:.1f}")
+
+else: # US Conventional
+    with col1:
+        st.subheader("📊 Aeration Tank & Sludge")
+        st.metric(label="BOD₅ Load (lbs/day)", value=f"{results['bodLoad_kg'] * KG_to_LBS:,.2f}")
+        st.metric(label="MLVSS Target (mg/L)", value=f"{results['MLVSS']:.0f}")
+        st.metric(label="Required Tank Volume (gallons)", value=f"{results['tankVolume_m3'] * M3_to_GAL:,.0f}")
+        st.metric(label="HRT (hours)", value=f"{results['hrt_hr']:.2f}")
+        st.metric(label="Sludge Wasted (WAS, lbs/day)", value=f"{results['was_kg'] * KG_to_LBS:,.2f}")
+        st.metric(label="F:M Ratio", value=f"{results['fmRatio']:.2f}")
+
+    with col2:
+        st.subheader("💧 Secondary Clarifier")
+        st.metric(label="Peak Flow (MGD)", value=f"{results['qPeak_m3d'] / MGD_to_M3D:.2f}")
+        st.metric(label="Required Surface Area (ft²)", value=f"{results['clarifierArea_m2'] * M2_to_FT2:,.1f}")
+        
+        peak_sor_val = results['peakSOR_mmd'] / GFD_to_MMD
+        max_sor_val = inputs['maxSOR']
+        st.metric(label="Peak SOR (gal/ft²·d)", value=f"{peak_sor_val:,.2f}")
+        if peak_sor_val > max_sor_val:
+            st.error(f"Warning: Peak SOR ({peak_sor_val:,.2f}) exceeds max ({max_sor_val:,.2f}).")
+        else:
+            st.success(f"Peak SOR is within the design limit.")
+
+        st.metric(label="Calculated Diameter (ft)", value=f"{results['clarifierDiameter_m'] * M_to_FT:.2f}")
+
+    with col3:
+        st.subheader("🦠 MBBR for Nitrification")
+        st.metric(label="Ammonia Load (lbs/day)", value=f"{results['nh3nLoad_kg'] * KG_to_LBS:,.2f}")
+        st.metric(label="Required Carrier Surface Area (ft²)", value=f"{results['requiredCarrierArea_m2'] * M2_to_FT2:,.0f}")
+        st.metric(label="Required Carrier Volume (ft³)", value=f"{results['carrierVolume_m3'] * M3_to_GAL / 7.481:,.1f}") # 7.481 gal/ft³
+        st.metric(label="Required MBBR Tank Volume (ft³)", value=f"{results['mbbrTankVolume_m3'] * M3_to_GAL / 7.481:,.1f}")
+
 
 # --- Instructions and Notes ---
-with st.expander("About This Dynamic Simulator"):
+with st.expander("About this Calculator and Formulas Used"):
     st.markdown("""
-        ### What's New?
-        You can now select your preferred unit system—**Conventional** (m³/day, mg/L) or **SI** (m³/s, kg/m³)—from the sidebar. The app automatically handles all necessary conversions for the simulation.
-        ### The Model
-        The simulation is based on a **Completely Stirred Tank Reactor (CSTR)** model using **Monod kinetics**.
-        *Disclaimer: This is a simplified educational model. Real-world systems are more complex and professional designs require comprehensive software like GPS-X, BioWin, or WEST.*
+        ### How to Use
+        1.  **Select Unit System:** Choose between Metric and US Conventional units in the sidebar.
+        2.  **Adjust Inputs:** Use the controls in the sidebar to enter your specific project data and design assumptions.
+        3.  **Review Outputs:** The calculated design parameters will update automatically in the main panel in the chosen units.
+        4.  **Check Warnings:** Pay attention to any success, warning, or error messages, as they indicate if key design parameters are within typical limits.
+
+        ### Key Formulas (Calculated in Metric)
+        - **Aeration Tank Volume (V):** `V = (Q * Y * (S₀ - Se) * SRT) / (MLVSS * (1 + kₔ * SRT))`
+        - **Sludge Wasted (Px):** `Px = (V * MLVSS) / SRT`
+        - **F:M Ratio:** `F:M = (Q * S₀) / (V * MLVSS)`
+        - **Clarifier Area (A):** `A = Q_peak / SOR_max`
+        - **MBBR Required Surface Area (A_carrier):** `A_carrier = (NH₃-N Load * 1000) / SALR`
+        ---
+        *Disclaimer: This is a tool for preliminary design and educational purposes. Final engineering designs should be conducted and verified by a qualified professional.*
     """)
